@@ -951,8 +951,13 @@ class MusicApi {
   }
 
   Future<List<SearchHotCategory>> searchHotKeywords() async {
-    final json = asMap(await _client.get('/search/hot'));
-    return asList(json['list'])
+    final raw = await _client.get('/search/hot');
+    final json = asMap(raw);
+    // `ApiClient` 已解包 data，热词列表可能直接是数组
+    final items = raw is List
+        ? raw
+        : asList(json['list'] ?? json['data'] ?? json['hot']);
+    return items
         .whereType<Map<String, dynamic>>()
         .map(SearchHotCategory.fromJson)
         .toList();
@@ -960,25 +965,35 @@ class MusicApi {
 
   /// 搜索联想词。
   ///
-  /// `/search/suggest` 的响应是分组结构，主分组形如
-  /// `data[0].RecordDatas[].HintInfo`；后面的 MV、专辑分组会带
-  /// 「歌手 - 专辑」这类内容，混进搜索框会很吵，所以只取主分组，
-  /// 主分组为空时才退回其它分组兜底。
+  /// 响应原始结构是按分组组织的：`data[0].RecordDatas[].HintInfo`，
+  /// 但 [ApiClient] 已经把 `data` 解包，所以这里拿到的是分组数组本身；
+  /// 仍需兼容未解包的 `{data: [...]}` 与更早的平铺 `music` 结构。
+  ///
+  /// 后面的 MV、专辑分组会带「歌手 - 专辑」这类内容，混进搜索框会很吵，
+  /// 因此只取主分组，主分组为空时才退回其它分组兜底。
   Future<List<String>> searchSuggest(String keywords) async {
-    final json = asMap(
-      await _client.get('/search/suggest', {'keywords': keywords}),
-    );
-    final groups = asList(json['data']).whereType<Map>().toList();
-    if (groups.isEmpty) {
-      // 兼容旧版平铺结构
-      return asList(json['music'])
-          .whereType<Map<String, dynamic>>()
-          .map((item) => asString(item['keyword']) ?? '')
-          .where((k) => k.isNotEmpty)
-          .toList();
-    }
+    final raw = await _client.get('/search/suggest', {'keywords': keywords});
 
-    List<String> readGroup(Map group) => asList(asMap(group)['RecordDatas'])
+    final List groups;
+    if (raw is List) {
+      groups = raw;
+    } else {
+      final json = asMap(raw);
+      if (json['data'] is List) {
+        // 未解包的情况
+        groups = asList(json['data']);
+      } else {
+        // 兼容更早的平铺结构
+        return asList(json['music'])
+            .whereType<Map<String, dynamic>>()
+            .map((item) => asString(item['keyword']) ?? '')
+            .where((k) => k.isNotEmpty)
+            .toList();
+      }
+    }
+    if (groups.isEmpty) return const [];
+
+    List<String> readGroup(Object? group) => asList(asMap(group)['RecordDatas'])
         .whereType<Map>()
         .map((item) => asString(asMap(item)['HintInfo']) ?? '')
         .where((hint) => hint.isNotEmpty)
