@@ -65,6 +65,31 @@ class QueueOrigin {
   }
 }
 
+/// 解析磁盘上保存的播放进度。
+///
+/// 新格式是 `{"hash": "...", "ms": 12345}`，只有 hash 与 [songHash] 一致
+/// 才采用，避免把上一首的位置套到新歌上；旧格式是纯 int 毫秒值，直接兼容。
+/// 返回 null 表示没有可用进度。
+Duration? parseSavedPosition(Object? raw, String? songHash) {
+  if (raw is int) {
+    return raw > 0 ? Duration(milliseconds: raw) : null;
+  }
+  if (raw is! String || raw.isEmpty) return null;
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map<String, dynamic>) return null;
+    final hash = asString(decoded['hash']);
+    final ms = asInt(decoded['ms']);
+    if (ms == null || ms <= 0) return null;
+    if (songHash != null && songHash.isNotEmpty && hash != songHash) {
+      return null;
+    }
+    return Duration(milliseconds: ms);
+  } catch (_) {
+    return null;
+  }
+}
+
 class AudioEffectPreset {
   const AudioEffectPreset({required this.name, required this.levels});
 
@@ -300,6 +325,15 @@ class PlayerController extends ChangeNotifier {
   QueueOrigin? _queueOrigin;
 
   QueueOrigin? get queueOrigin => _queueOrigin;
+
+  /// 从磁盘恢复出来、尚未在音频引擎上生效的播放进度。
+  ///
+  /// 恢复队列时音频源还没加载，此时 seek 无效；由 [prepareRestoredSong]
+  /// 在音源加载完成后取走并真正跳转，跳完即置空。
+  Duration? _resumePosition;
+
+  /// 是否还有待应用的恢复进度（UI 可据此显示「已恢复」提示）。
+  bool get hasPendingResumePosition => _resumePosition != null;
 
   List<LyricLine> lyrics = const [];
   PlaybackMode playbackMode = PlaybackMode.playlistLoop;
@@ -571,6 +605,8 @@ class PlayerController extends ChangeNotifier {
       }
     }
     currentSong = song;
+    // 用户主动点歌/切歌后，磁盘上待恢复的进度不再适用
+    _resumePosition = null;
     if (queue != null && queue.isNotEmpty) {
       this.queue = queue;
       // 只有换了一整套队列时才更新来源；在队列内部切歌不能把来源丢掉
@@ -1274,6 +1310,9 @@ class PlayerController extends ChangeNotifier {
   Future<void> togglePlay() async {
     if (audioPlayer.playing) {
       await _audioHandler.pause();
+      // 暂停瞬间落盘一次进度：用户经常暂停后直接退出，5 秒定时器
+      // 可能还没触发，位置会停留在上一次保存点。
+      _saveCurrentPosition();
     } else {
       if (audioPlayer.processingState == ProcessingState.completed) {
         await _audioHandler.seek(Duration.zero);
@@ -2687,9 +2726,16 @@ class PlayerController extends ChangeNotifier {
     // 先写快照（单次原子写入），再更新进度。
     await prefs.setString(_stateKey, snapshot);
     if (song != null) {
-      // 进度单独保存：高频更新时无需重写整个队列
+      // 进度单独保存：高频更新时无需重写整个队列。
+      // 与歌曲 hash 绑定，避免位置被错配到别的歌上。
       final currentPos = audioPlayer.position;
-      await prefs.setInt(_currentPositionKey, currentPos.inMilliseconds);
+      await prefs.setString(
+        _currentPositionKey,
+        jsonEncode({
+          'hash': song.hash,
+          'ms': currentPos.inMilliseconds,
+        }),
+      );
     } else {
       await prefs.remove(_currentPositionKey);
     }
@@ -2706,13 +2752,26 @@ class PlayerController extends ChangeNotifier {
   }
 
   /// 保存当前播放进度。
+  ///
+  /// 进度必须与歌曲绑定（hash + 毫秒）一起存：只存毫秒的话，切歌与写盘
+  /// 交错时会把这个位置错配到下一首歌上，重进软件就跳到错误位置。
   void _saveCurrentPosition() {
-    if (currentSong == null) return;
+    final song = currentSong;
+    if (song == null) return;
     // 直接读取播放器的实时位置，避免使用可能过时的 position 变量
     final currentPos = audioPlayer.position;
-    SharedPreferences.getInstance().then((prefs) {
-      prefs.setInt(_currentPositionKey, currentPos.inMilliseconds);
+    final payload = jsonEncode({
+      'hash': song.hash,
+      'ms': currentPos.inMilliseconds,
     });
+    SharedPreferences.getInstance().then((prefs) async {
+      await prefs.setString(_currentPositionKey, payload);
+    });
+  }
+
+  /// 读取磁盘上保存的播放进度，返回 null 表示没有可用进度。
+  Duration? _readSavedPosition(SharedPreferences prefs, String? songHash) {
+    return parseSavedPosition(prefs.get(_currentPositionKey), songHash);
   }
 
   /// 停止定时保存播放进度。
@@ -2734,6 +2793,9 @@ class PlayerController extends ChangeNotifier {
     currentSong = songs.first;
     position = Duration.zero;
     positionNotifier.value = Duration.zero;
+    // 服务端「继续播放」不提供精确到毫秒的进度，清掉本地待恢复值，
+    // 避免把上一次本地记录的进度套到这首歌上。
+    _resumePosition = null;
     notifyListeners();
   }
 
@@ -2827,11 +2889,17 @@ class PlayerController extends ChangeNotifier {
       currentSong = restoredQueue.first;
     }
 
-    // 恢复播放进度
-    final posMs = prefs.getInt(_currentPositionKey);
-    if (posMs != null && posMs > 0 && currentSong != null) {
-      position = Duration(milliseconds: posMs);
+    // 恢复播放进度：只接受与当前歌曲 hash 匹配的记录。
+    // 旧版本只存毫秒值（int），升级后仍兼容读取。
+    final savedPosition = _readSavedPosition(prefs, currentSong?.hash);
+    if (savedPosition != null && savedPosition > Duration.zero) {
+      position = savedPosition;
       positionNotifier.value = position;
+      _resumePosition = savedPosition;
+    } else {
+      position = Duration.zero;
+      positionNotifier.value = Duration.zero;
+      _resumePosition = null;
     }
 
     _queueOrigin = restoredOrigin;
@@ -2907,8 +2975,9 @@ class PlayerController extends ChangeNotifier {
     climax = null;
     unawaited(_loadClimax(song));
 
-    // 在加载前保存恢复的进度（loadSong 会重置 position 为 0）
-    final restoredPosition = position;
+    // 在加载前保存恢复的进度（loadSong 会重置 position 为 0）。
+    // 优先用磁盘上待应用的进度，其次才是内存中的 position。
+    final restoredPosition = _resumePosition ?? position;
 
     isPreparing = true;
     notifyListeners();
@@ -2945,7 +3014,10 @@ class PlayerController extends ChangeNotifier {
         if (restoredPosition > Duration.zero) {
           await _audioHandler.seek(_clampPosition(restoredPosition));
           if (requestSerial != _playRequestSerial) return;
+          _setPositionBase(_clampPosition(restoredPosition), playing: false);
         }
+        // 进度已应用到音频引擎，清掉待恢复标记，避免后续再次跳转
+        _resumePosition = null;
 
         unawaited(loadLyrics(song));
         _startPositionSaving();
