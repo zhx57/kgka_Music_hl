@@ -386,7 +386,9 @@ class _SearchPageState extends State<SearchPage> {
         ),
         const SizedBox(width: 12),
         ElevatedButton(
-          onPressed: _onSubmit,
+          onPressed: _controller.text.trim().isNotEmpty
+              ? _onSubmit
+              : () => Navigator.of(context).pop(),
           style: ElevatedButton.styleFrom(
             backgroundColor: colorScheme.primary,
             foregroundColor: colorScheme.onPrimary,
@@ -395,9 +397,9 @@ class _SearchPageState extends State<SearchPage> {
               borderRadius: BorderRadius.circular(AppRadius.xxl),
             ),
           ),
-          child: const Text(
-            '搜索',
-            style: TextStyle(fontWeight: FontWeight.bold),
+          child: Text(
+            _controller.text.trim().isNotEmpty ? '搜索' : '取消',
+            style: const TextStyle(fontWeight: FontWeight.bold),
           ),
         ),
       ],
@@ -548,10 +550,14 @@ class _SearchPageState extends State<SearchPage> {
             ),
           ),
           actions: [
+            // 有内容时右上角是「搜索」，点一下主动发起搜索；
+            // 输入框清空后变回「取消」，点了关闭搜索页。
             TextButton(
-              onPressed: () => Navigator.of(context).pop(),
+              onPressed: _controller.text.trim().isNotEmpty
+                  ? _onSubmit
+                  : () => Navigator.of(context).pop(),
               child: Text(
-                '取消',
+                _controller.text.trim().isNotEmpty ? '搜索' : '取消',
                 style: TextStyle(
                   color: colorScheme.primary,
                   fontWeight: FontWeight.w700,
