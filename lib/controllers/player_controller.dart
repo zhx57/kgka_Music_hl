@@ -29,6 +29,42 @@ import 'local_music_controller.dart';
 
 enum PlaybackMode { playlistLoop, shuffle, singleLoop }
 
+/// 播放队列的来源（歌单 / 专辑）。
+///
+/// 只持久化队列本身不够：进程被系统回收时快照可能缺失或残缺，重启后队列
+/// 退化成单曲，点「下一首」看起来毫无反应。记住来源后，恢复时发现队列
+/// 不完整就能按来源重新拉一遍，保证切歌始终在原来的歌单里进行。
+class QueueOrigin {
+  const QueueOrigin({required this.kind, required this.id, this.title});
+
+  const QueueOrigin.playlist({required String id, String? title})
+    : this(kind: 'playlist', id: id, title: title);
+
+  const QueueOrigin.album({required String id, String? title})
+    : this(kind: 'album', id: id, title: title);
+
+  final String kind;
+  final String id;
+  final String? title;
+
+  bool get isAlbum => kind == 'album';
+
+  Map<String, dynamic> toJson() => {
+    'kind': kind,
+    'id': id,
+    if (title != null) 'title': title,
+  };
+
+  static QueueOrigin? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final map = asMap(value);
+    final kind = asString(map['kind']);
+    final id = asString(map['id']);
+    if (kind == null || id == null || id.isEmpty) return null;
+    return QueueOrigin(kind: kind, id: id, title: asString(map['title']));
+  }
+}
+
 class AudioEffectPreset {
   const AudioEffectPreset({required this.name, required this.levels});
 
@@ -69,6 +105,13 @@ class PlayerController extends ChangeNotifier {
   static const _currentSongKey = 'playback.current_song';
   static const _currentPositionKey = 'playback.current_position';
   static const _playbackModeKey = 'playback.mode';
+
+  /// 播放状态快照（队列 + 当前歌曲 + 播放模式一次写入）。
+  ///
+  /// 旧实现把这几个字段拆成多次 `setString` 写入，进程在两次写入之间被杀
+  /// 就会出现「当前歌曲已保存、队列没保存」的残缺状态：重启后只剩一首歌，
+  /// 点「下一首」永远原地不动，必须重新进歌单点播才能恢复。
+  static const _stateKey = 'playback.state_snapshot';
   static const _queueSaveDebounceMs = 500;
   static const _positionSaveInterval = Duration(seconds: 5);
   static const _listenTimeReportInterval = Duration(minutes: 5);
@@ -252,6 +295,12 @@ class PlayerController extends ChangeNotifier {
 
   Song? currentSong;
   List<Song> queue = const [];
+
+  /// 当前队列来自哪个歌单/专辑（用于重启后重建完整队列）。
+  QueueOrigin? _queueOrigin;
+
+  QueueOrigin? get queueOrigin => _queueOrigin;
+
   List<LyricLine> lyrics = const [];
   PlaybackMode playbackMode = PlaybackMode.playlistLoop;
   Duration position = Duration.zero;
@@ -478,6 +527,7 @@ class PlayerController extends ChangeNotifier {
     Song song, {
     List<Song>? queue,
     bool preservePersonalFmSession = false,
+    QueueOrigin? origin,
   }) async {
     final requestSerial = ++_playRequestSerial;
     debugPrint(
@@ -523,8 +573,15 @@ class PlayerController extends ChangeNotifier {
     currentSong = song;
     if (queue != null && queue.isNotEmpty) {
       this.queue = queue;
+      // 只有换了一整套队列时才更新来源；在队列内部切歌不能把来源丢掉
+      if (replacesQueue) {
+        _queueOrigin = origin;
+      } else if (origin != null) {
+        _queueOrigin = origin;
+      }
     } else if (this.queue.isEmpty) {
       this.queue = [song];
+      _queueOrigin = origin;
     }
     final songIdentity = _songIdentity(song);
     if (playbackMode == PlaybackMode.shuffle && replacesQueue) {
@@ -1948,6 +2005,12 @@ class PlayerController extends ChangeNotifier {
     if (isForeground) {
       // 点开软件或切回前台时，重置用户本次临时关闭悬浮窗的标记，恢复自启动
       _desktopLyricsUserDismissed = false;
+    } else {
+      // 退到后台时立刻落盘一次完整队列。系统可能在任意时刻回收进程，
+      // 只依赖 500ms 防抖 + dispose 会导致「歌曲存了、队列丢了」，
+      // 重启后队列退化成单曲，无法在歌单内切歌。
+      _queueSaveTimer?.cancel();
+      unawaited(_persistQueueState());
     }
     if (_isAppForeground == isForeground) return;
     _isAppForeground = isForeground;
@@ -2392,6 +2455,20 @@ class PlayerController extends ChangeNotifier {
       return queue[index + 1];
     }
 
+    // index == -1 说明当前歌曲不在队列里（重启后快照残缺、外部入口切歌等）。
+    // 此时不能直接返回 queue.first：若它正好就是当前歌曲，「下一首」会永远
+    // 原地重播同一首，表现为完全无法切歌。改为挑一首不同的歌。
+    if (index < 0 && queue.length > 1) {
+      final currentIdentity = currentSong == null
+          ? ''
+          : _songIdentity(currentSong!);
+      final different = queue.firstWhere(
+        (song) => _songIdentity(song) != currentIdentity,
+        orElse: () => queue.first,
+      );
+      return different;
+    }
+
     return queue.first;
   }
 
@@ -2593,23 +2670,31 @@ class PlayerController extends ChangeNotifier {
   }
 
   /// 立即持久化播放队列、当前歌曲和播放模式。
+  ///
+  /// 队列、当前歌曲、播放模式必须作为**同一个 JSON 快照**写入：
+  /// SharedPreferences 的多次写入不是原子的，一旦进程在中间被杀，
+  /// 重启后就会出现「当前歌曲存在但队列丢了」的残缺状态，表现为
+  /// 无法在歌单内切歌（下一首永远是它自己），必须重新进歌单点播。
   Future<void> _persistQueueState() async {
     final prefs = await SharedPreferences.getInstance();
     final song = currentSong;
+    final snapshot = jsonEncode({
+      'mode': playbackMode.name,
+      'currentSong': song?.toCache(),
+      'queue': queue.map((s) => s.toCache()).toList(),
+      if (_queueOrigin != null) 'origin': _queueOrigin!.toJson(),
+    });
+    // 先写快照（单次原子写入），再更新进度。
+    await prefs.setString(_stateKey, snapshot);
     if (song != null) {
-      await prefs.setString(_currentSongKey, jsonEncode(song.toCache()));
-      // 直接读取播放器的实时位置
+      // 进度单独保存：高频更新时无需重写整个队列
       final currentPos = audioPlayer.position;
       await prefs.setInt(_currentPositionKey, currentPos.inMilliseconds);
     } else {
-      await prefs.remove(_currentSongKey);
       await prefs.remove(_currentPositionKey);
     }
-    await prefs.setString(
-      _queueKey,
-      jsonEncode(queue.map((s) => s.toCache()).toList()),
-    );
-    await prefs.setString(_playbackModeKey, playbackMode.name);
+    // 旧版本的分散字段不再写入：歌单动辄上千首，写多份副本会显著拖慢
+    // 主线程外的序列化，也更容易在写入中途被杀导致状态残缺。
   }
 
   /// 启动定时保存播放进度（每 5 秒）。
@@ -2658,8 +2743,64 @@ class PlayerController extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     if (requestSerial != _playRequestSerial) return false;
 
+    String? modeName;
+    List<Song> restoredQueue = const [];
+    Song? restoredSong;
+    QueueOrigin? restoredOrigin;
+
+    // 优先读快照：队列/当前歌曲/模式是同一次写入，不会出现残缺组合。
+    final snapshotJson = prefs.getString(_stateKey);
+    if (snapshotJson != null && snapshotJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(snapshotJson);
+        if (decoded is Map<String, dynamic>) {
+          modeName = asString(decoded['mode']);
+          restoredQueue = asList(decoded['queue'])
+              .whereType<Map<String, dynamic>>()
+              .map(Song.fromCache)
+              .where((s) => s.hash.isNotEmpty)
+              .toList();
+          restoredOrigin = QueueOrigin.fromJson(decoded['origin']);
+          final songJson = decoded['currentSong'];
+          if (songJson is Map<String, dynamic>) {
+            restoredSong = Song.fromCache(songJson);
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 兼容旧版本的分散字段（升级后首次启动）。
+    if (modeName == null) {
+      modeName = prefs.getString(_playbackModeKey);
+    }
+    if (restoredQueue.isEmpty) {
+      final queueJson = prefs.getString(_queueKey);
+      if (queueJson != null && queueJson.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(queueJson);
+          if (decoded is List) {
+            restoredQueue = decoded
+                .whereType<Map<String, dynamic>>()
+                .map(Song.fromCache)
+                .where((s) => s.hash.isNotEmpty)
+                .toList();
+          }
+        } catch (_) {}
+      }
+    }
+    if (restoredSong == null) {
+      final songJson = prefs.getString(_currentSongKey);
+      if (songJson != null && songJson.isNotEmpty) {
+        try {
+          final decoded = jsonDecode(songJson);
+          if (decoded is Map<String, dynamic>) {
+            restoredSong = Song.fromCache(decoded);
+          }
+        } catch (_) {}
+      }
+    }
+
     // 恢复播放模式
-    final modeName = prefs.getString(_playbackModeKey);
     if (modeName != null) {
       for (final mode in PlaybackMode.values) {
         if (mode.name == modeName) {
@@ -2669,44 +2810,81 @@ class PlayerController extends ChangeNotifier {
       }
     }
 
-    // 恢复播放队列
-    final queueJson = prefs.getString(_queueKey);
-    if (queueJson != null && queueJson.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(queueJson);
-        if (decoded is List) {
-          final restored = decoded
-              .whereType<Map<String, dynamic>>()
-              .map(Song.fromCache)
-              .where((s) => s.hash.isNotEmpty)
-              .toList();
-          if (restored.isNotEmpty) {
-            queue = restored;
-          }
-        }
-      } catch (_) {}
-    }
-
-    // 恢复当前歌曲
-    final songJson = prefs.getString(_currentSongKey);
-    if (songJson != null && songJson.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(songJson);
-        if (decoded is Map<String, dynamic>) {
-          currentSong = Song.fromCache(decoded);
-        }
-      } catch (_) {}
+    // 恢复当前歌曲：队列里找不到时补进去，否则 currentIndex 为 -1，
+    // 「下一首」会一直返回同一首，看起来就是无法切歌。
+    if (restoredSong != null && restoredSong.hash.isNotEmpty) {
+      final identity = _songIdentity(restoredSong);
+      if (restoredQueue.isNotEmpty &&
+          !restoredQueue.any((item) => _songIdentity(item) == identity)) {
+        restoredQueue = List<Song>.of(restoredQueue)..add(restoredSong);
+      }
+      queue = restoredQueue.isEmpty
+          ? [restoredSong]
+          : List<Song>.of(restoredQueue);
+      currentSong = restoredSong;
+    } else if (restoredQueue.isNotEmpty) {
+      queue = List<Song>.of(restoredQueue);
+      currentSong = restoredQueue.first;
     }
 
     // 恢复播放进度
     final posMs = prefs.getInt(_currentPositionKey);
-    if (posMs != null && posMs > 0) {
+    if (posMs != null && posMs > 0 && currentSong != null) {
       position = Duration(milliseconds: posMs);
       positionNotifier.value = position;
     }
 
+    _queueOrigin = restoredOrigin;
     notifyListeners();
+
+    // 队列残缺（只剩一首或为空）时按来源补全，保证能继续切歌。
+    // 放在 notifyListeners 之后：界面先用已恢复内容渲染，补全后台完成。
+    if (restoredOrigin != null && queue.length <= 1) {
+      unawaited(_rebuildQueueFromOrigin());
+    }
     return true;
+  }
+
+  /// 按记忆的队列来源重新拉取完整歌单/专辑，并用它替换当前队列。
+  ///
+  /// 只在队列明显残缺时触发；当前歌曲不在新队列里就补到队尾，
+  /// 避免 currentIndex 变成 -1 导致「下一首」原地不动。
+  Future<void> _rebuildQueueFromOrigin() async {
+    final origin = _queueOrigin;
+    final song = currentSong;
+    if (origin == null || song == null) return;
+    final requestSerial = _playRequestSerial;
+    try {
+      final songs = origin.isAlbum
+          ? await _api.albumSongs(origin.id, pageSize: 5000)
+          : await _api.playlistSongs(origin.id, fetchAll: true);
+      if (requestSerial != _playRequestSerial ||
+          _queueOrigin != origin ||
+          songs.isEmpty) {
+        return;
+      }
+      final identity = _songIdentity(song);
+      final rebuilt = List<Song>.of(songs);
+      if (!rebuilt.any((item) => _songIdentity(item) == identity)) {
+        rebuilt.add(song);
+      }
+      queue = rebuilt;
+      if (playbackMode == PlaybackMode.shuffle) {
+        _shuffleCycle.reset(
+          queue.map(_songIdentity).where((identity) => identity.isNotEmpty),
+          current: identity,
+        );
+      }
+      await _audioHandler.setSongQueue(
+        queueSongs: queue,
+        queueIndex: currentIndex,
+        currentSong: song,
+      );
+      _saveQueueState();
+      notifyListeners();
+    } catch (_) {
+      // 重建失败保持已恢复的队列，用户重新点歌单也能恢复
+    }
   }
 
   /// 在恢复队列后加载并准备播放当前歌曲（默认不自动播放，仅预加载）。
