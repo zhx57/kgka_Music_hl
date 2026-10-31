@@ -300,6 +300,9 @@ class PlayerController extends ChangeNotifier {
   Timer? _playCacheTimer;
   DateTime? _listenTimeStartedAt;
   Duration _pendingListenTime = Duration.zero;
+
+  /// 上一次写入本地听歌统计的累计时长（用于增量落盘）。
+  Duration _lastStatsFlush = Duration.zero;
   bool _isReportingListenTime = false;
   int _seekSerial = 0;
   bool _isSeeking = false;
@@ -2216,6 +2219,8 @@ class PlayerController extends ChangeNotifier {
     final savedPendingMs = prefs.getInt(_pendingListenTimeKey) ?? 0;
     if (savedPendingMs > 0) {
       _pendingListenTime = Duration(milliseconds: savedPendingMs);
+      // 这部分时长在上次运行中已经计入本地统计，水位对齐避免重复累加。
+      _lastStatsFlush = _pendingListenTime;
     }
     bluetoothLyricsTitleSyncEnabled =
         prefs.getBool(_bluetoothLyricsTitleSyncSettingKey) ?? false;
@@ -2343,12 +2348,19 @@ class PlayerController extends ChangeNotifier {
       _listenTimeStartedAt ??= DateTime.now();
       _listenTimeTimer ??= Timer.periodic(
         _listenTimeCheckInterval,
-        (_) => unawaited(_maybeReportListeningTime()),
+        (_) => unawaited(_onListenTimeTick()),
       );
       return;
     }
 
     _pauseListeningTimeTracker();
+  }
+
+  /// 每 15 秒一次：独立累计本地统计，并按 5 分钟周期向服务端上报。
+  Future<void> _onListenTimeTick() async {
+    // 本地统计与本地上报互不影响：先落盘，再尝试上报。
+    await _flushListenStats();
+    await _maybeReportListeningTime();
   }
 
   void _pauseListeningTimeTracker() {
@@ -2359,14 +2371,34 @@ class PlayerController extends ChangeNotifier {
       SharedPreferences.getInstance().then((prefs) {
         prefs.setInt(_pendingListenTimeKey, _pendingListenTime.inMilliseconds);
       }).catchError((_) {});
+      // 暂停/切歌时立刻把已听时长结进本地统计，避免只听了十几秒就退出
+      // 导致这段时间完全没有被记录。
+      unawaited(_flushListenStats());
     }
     _listenTimeTimer?.cancel();
     _listenTimeTimer = null;
   }
 
+  /// 把尚未计入本地统计的听歌时长增量写入统计。
+  ///
+  /// 与服务端上报完全解耦：接口失败、未登录、离线播放都不影响本地统计。
+  Future<void> _flushListenStats() async {
+    final tracked = _trackedListeningTime();
+    final delta = tracked - _lastStatsFlush;
+    if (delta < const Duration(seconds: 1)) return;
+    _lastStatsFlush = tracked;
+    try {
+      await _statsService.addListenTime(delta);
+    } catch (_) {
+      // 写盘失败时回退基准，下次继续尝试
+      _lastStatsFlush -= delta;
+    }
+  }
+
   void _resetListeningTimeTracker() {
     _listenTimeStartedAt = null;
     _pendingListenTime = Duration.zero;
+    _lastStatsFlush = Duration.zero;
     _listenTimeTimer?.cancel();
     _listenTimeTimer = null;
     SharedPreferences.getInstance().then((prefs) {
@@ -2392,15 +2424,19 @@ class PlayerController extends ChangeNotifier {
 
     _isReportingListenTime = true;
     try {
+      // 先把服务端上报前已累积的本地时长结清，避免上报成功后水位跳变
+      // 让后续增量算成负数而丢失。
+      await _flushListenStats();
       await _api.addListeningTime();
-      // 上报成功，同步记录本地统计的听歌时长
-      unawaited(_statsService.addListenTime(_listenTimeReportInterval));
+      // 本地统计已由 _flushListenStats 独立累计，这里只清算上报水位。
       final stillPlaying = isPlaying && currentSong != null;
       final remainder = _trackedListeningTime() - _listenTimeReportInterval;
       _pendingListenTime = remainder > Duration.zero
           ? remainder
           : Duration.zero;
       _listenTimeStartedAt = stillPlaying ? DateTime.now() : null;
+      // 上报水位与本地统计水位一起归零对齐
+      _lastStatsFlush = _pendingListenTime;
       if (!stillPlaying) {
         _listenTimeTimer?.cancel();
         _listenTimeTimer = null;
@@ -2408,6 +2444,7 @@ class PlayerController extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_pendingListenTimeKey);
     } catch (error) {
+      // 服务端失败不影响本地统计，只记录日志
       debugPrint('[KA Music][listen-time] report failed: $error');
     } finally {
       _isReportingListenTime = false;
