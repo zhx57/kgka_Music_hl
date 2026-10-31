@@ -506,6 +506,78 @@ class MusicApi {
         .toList();
   }
 
+  /// 拉取单曲的完整元信息（专辑名、发行日期、时长、封面）。
+  ///
+  /// 详情页只持有各入口解析出来的 [Song]，而部分入口（私人 FM、排行榜、
+  /// 云盘、推荐卡片等）本身不带专辑与发行信息，直接展示会全是「未知」。
+  /// 这里用 `/privilege/lite` 补齐专辑名/时长/封面，再用 `/album/detail`
+  /// 补发行日期。任一步失败都返回已拿到的部分，调用方继续用本地字段兜底。
+  Future<Song?> songDetail(Song song) async {
+    if (song.source != SongSource.kugou ||
+        song.hash.isEmpty ||
+        song.hash.startsWith('ne_')) {
+      return null;
+    }
+    final raw = await _client.get('/privilege/lite', {
+      'hash': song.hash,
+      if ((song.albumId ?? '').isNotEmpty && song.albumId != '0')
+        'album_id': song.albumId,
+    });
+    final item = raw is List
+        ? (raw.isEmpty ? const <String, dynamic>{} : asMap(raw.first))
+        : asMap(raw);
+    if (item.isEmpty) return null;
+
+    final info = asMap(item['info']);
+    final transParam = asMap(item['trans_param']);
+    final rawAlbumId = asString(item['album_id']);
+    final albumId = (rawAlbumId == null || rawAlbumId == '0')
+        ? song.albumId
+        : rawAlbumId;
+    var albumName = asString(item['albumname']) ?? song.albumName;
+    var releaseDate = song.releaseDate;
+
+    if (albumId != null &&
+        albumId.isNotEmpty &&
+        albumId != '0' &&
+        (albumName == null || releaseDate == null)) {
+      try {
+        final albumRaw = await _client.get('/album/detail', {'id': albumId});
+        final album = albumRaw is List
+            ? (albumRaw.isEmpty
+                  ? const <String, dynamic>{}
+                  : asMap(albumRaw.first))
+            : asMap(albumRaw);
+        albumName ??= asString(album['album_name']);
+        releaseDate ??= releaseDateFromString(album['publish_date']);
+      } catch (_) {
+        // 专辑详情失败不影响其它字段
+      }
+    }
+
+    return Song(
+      id: song.id,
+      title: song.title,
+      artist: asString(item['singername']) ?? song.artist,
+      hash: song.hash,
+      albumId: albumId,
+      albumAudioId:
+          asString(item['album_audio_id']) ?? song.albumAudioId,
+      albumName: albumName,
+      coverUrl: normalizeImageUrl(
+        asString(transParam['union_cover']) ??
+            asString(info['image']) ??
+            song.coverUrl,
+      ),
+      duration:
+          durationFromMilliseconds(info['duration']) ?? song.duration,
+      releaseDate: releaseDate,
+      artists: song.artists,
+      isCloudDrive: song.isCloudDrive,
+      source: song.source,
+    );
+  }
+
   Future<List<Song>> albumSongs(
     String id, {
     int page = 1,
